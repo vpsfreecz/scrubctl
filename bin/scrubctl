@@ -1,0 +1,187 @@
+#!/usr/bin/env ruby
+require 'optparse'
+
+class Pool
+  def self.get(pool_name, **kwargs)
+    pool = new(pool_name, **kwargs)
+    pool.read_status
+    pool
+  end
+
+  attr_reader :pool_name, :resilver_running, :scrub_running, :scrub_paused
+
+  def initialize(pool_name, dry_run: false)
+    @pool_name = pool_name
+    @dry_run = dry_run
+    @resilver_running = false
+    @scrub_running = false
+    @scrub_paused = false
+  end
+
+  def read_status
+    str = `zpool status #{pool_name}`
+    
+    if $?.exitstatus != 0
+      fail "zpool status #{pool_name} exited with #{$?.exitstatus}"
+    end
+
+    str.each_line do |line|
+      stripped = line.strip
+      next unless stripped.start_with?('scan:')
+
+      scan = line.strip[5..-1].strip
+
+      if scan.start_with?('resilver in progress')
+        @resilver_running = true
+      elsif scan.start_with?('scrub in progress')
+        @scrub_running = true
+      elsif scan.start_with?('scrub paused')
+        @scrub_paused = true
+      end
+
+      break
+    end
+  end
+
+  def start_scrub
+    run_command('zpool', 'scrub', pool_name)
+  end
+
+  def stop_scrub
+    run_command('zpool', 'scrub', '-s', pool_name)
+  end
+
+  def pause_scrub
+    run_command('zpool', 'scrub', '-p', pool_name)
+  end
+
+  protected
+  attr_reader :dry_run
+
+  def run_command(*cmd)
+    if dry_run
+      puts cmd.join(' ')
+      return
+    end
+
+    unless Kernel.system(*cmd)
+      fail "Command '#{cmd.join(' ')}' failed with non-zero exit status"
+    end
+  end
+end
+
+class Cli
+  def self.run(args)
+    cli = new
+    cli.run(args)
+  end
+
+  attr_reader :dry_run, :quiet
+
+  def initialize
+    @dry_run = false
+  end
+
+  def run(args)
+    opt_parser = OptionParser.new do |opts|
+      opts.banner = "Usage: #{$0} start|resume|pause|stop pool..."
+
+      opts.on('-n', '--dry-run', 'Only print what would happen') do
+        @dry_run = true
+      end
+
+      opts.on('-q', '--quiet', 'Print only fatal errors') do
+        @quiet = true
+      end
+
+      opts.on('-h', '--help', 'Show this message') do
+        puts show_help(opt_parser)
+        exit
+      end
+    end
+      
+    opt_parser.parse!(args)
+
+    if args.length < 2
+      if args.length < 1
+        warn "Specify command"
+      else
+        warn "Specify pool name"
+      end
+      
+      warn show_help(opt_parser)
+      exit(false)
+    end
+
+    cmd = args.shift
+
+    unless %w(start resume pause stop).include?(cmd)
+      warn "Unknown command '#{cmd}'"
+      warn show_help(opt_parser)
+      exit(false)
+    end
+
+    args.each do |pool_name|
+      begin
+        pool = Pool.get(pool_name, dry_run: dry_run)
+
+        if pool.resilver_running
+          show_error("#{pool_name} is being resilvered")
+        end
+
+        send(cmd.to_sym, pool)
+      rescue RuntimeError => e
+        warn "Error occurred: #{e.message}"
+        exit(false)
+      end
+    end
+  end
+
+  protected
+  def start(pool)
+    if !pool.scrub_running
+      pool.start_scrub
+    end
+  end
+
+  def stop(pool)
+    if pool.scrub_running
+      pool.stop_scrub
+    end
+  end
+
+  def resume(pool)
+    if pool.scrub_paused
+      pool.start_scrub
+    else
+      show_error("#{pool.pool_name} does not have a scrub to resume")
+    end
+  end
+
+  def pause(pool)
+    if !pool.scrub_running
+      show_error("#{pool.pool_name} does not have a scrub to pause")
+    elsif !pool.scrub_paused
+      pool.pause_scrub
+    end
+  end
+
+  def show_error(msg)
+    warn msg unless quiet
+    exit(false)
+  end
+
+  def show_help(opt_parser)
+    s = opt_parser.help
+    s << <<END
+
+Commands:
+  start        Initiate zpool scrub
+  stop         Stop zpool scrub
+  resume       Resume zpool scrub if it is currently paused
+  pause        Pause zpool scrub
+END
+  end
+end
+
+Cli.run(ARGV)
